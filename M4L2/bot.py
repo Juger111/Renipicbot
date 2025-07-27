@@ -1,110 +1,106 @@
+# bot.py
 import os
 import threading
 import time
 import sqlite3
+import cv2
 
 import schedule
 from telebot import TeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from logic import DatabaseManager, hide_img
+from logic import DatabaseManager, hide_img, create_collage
 from config import API_TOKEN, DATABASE
 
-# Инициализация бота и менеджера базы
 bot = TeleBot(API_TOKEN)
 manager = DatabaseManager(DATABASE)
 manager.create_tables()
 
-# Генерация разметки для кнопки
 def gen_markup(prize_id):
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(InlineKeyboardButton("Получить!", callback_data=str(prize_id)))
-    return markup
+    m = InlineKeyboardMarkup(row_width=1)
+    m.add(InlineKeyboardButton("Получить!", callback_data=str(prize_id)))
+    return m
 
-# Обработчик команды "/старт"
 @bot.message_handler(commands=['старт'])
-def handle_start(message):
-    user_id = message.chat.id
-    if user_id in manager.get_users():
-        bot.reply_to(message, "Ты уже зарегистрирован!")
+def handle_start(msg):
+    uid = msg.chat.id
+    if uid in manager.get_users():
+        bot.reply_to(msg, "Ты уже зарегистрирован!")
     else:
-        manager.add_user(user_id, message.from_user.username or '')
-        bot.reply_to(
-            message,
-            (
-                "Привет! Добро пожаловать!\n"
-                "Тебя успешно зарегистрировали.\n"
-                "Каждый час ты будешь получать новые картинки — попробуй первым нажать на кнопку 'Получить!'\n"
-                "Только первые три пользователя получат настоящий приз!"
-            )
-        )
+        manager.add_user(uid, msg.from_user.username or '')
+        bot.reply_to(msg, "Добро пожаловать! Жди рассылок и успей нажать «Получить!» первым.")
 
-# Обработчик команды "/рейтинг"
 @bot.message_handler(commands=['рейтинг'])
-def handle_rating(message):
+def handle_rating(msg):
     rating = manager.get_rating()
     if not rating:
-        bot.send_message(message.chat.id, "Рейтинг пока пуст.")
+        bot.send_message(msg.chat.id, "Рейтинг пока пуст.")
         return
-    text = "Топ 10 пользователей по количеству призов:\n"
-    for i, (user_name, count) in enumerate(rating, start=1):
-        text += f"{i}. {user_name} — {count}\n"
-    bot.send_message(message.chat.id, text)
+    txt = "Топ-10 по призам:\n" + "\n".join(f"{i+1}. {u} — {c}" for i,(u,c) in enumerate(rating))
+    bot.send_message(msg.chat.id, txt)
 
-# Обработчик нажатия на кнопку "Получить!"
-@bot.callback_query_handler(func=lambda call: call.data and call.data.isdigit())
-def handle_prize_callback(call):
-    prize_id = int(call.data)
-    user_id = call.from_user.id
-    # Сколько уже получили этот приз
-    count = manager.get_winners_count(prize_id)
-    if count < 3:
-        # Отправляем оригинальное изображение
-        img = manager.get_prize_img(prize_id)
+@bot.message_handler(commands=['мои_достижения'])
+def handle_my_score(msg):
+    uid = msg.chat.id
+    won = manager.get_winners_img(uid)  # список имён файлов
+    all_imgs = [f for f in os.listdir('img') if os.path.isfile(os.path.join('img', f))]
+    paths = []
+    for fname in all_imgs:
+        if fname in won:
+            paths.append(os.path.join('img', fname))
+        else:
+            paths.append(os.path.join('hidden_img', fname))
+    try:
+        collage = create_collage(paths)
+        tmp = f'collage_{uid}.jpg'
+        cv2.imwrite(tmp, collage)
+        with open(tmp, 'rb') as ph:
+            bot.send_photo(uid, ph, caption="Твои достижения 🎉")
+        os.remove(tmp)
+    except Exception as e:
+        bot.send_message(uid, f"Не удалось собрать коллаж: {e}")
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.isdigit())
+def handle_prize_cb(call):
+    pid = int(call.data)
+    uid = call.from_user.id
+    already = manager.get_winners_count(pid)
+    if already < 3:
+        img = manager.get_prize_img(pid)
         if img:
-            with open(os.path.join('img', img), 'rb') as photo:
-                bot.send_photo(call.message.chat.id, photo)
-            # Записываем победителя в таблицу winners
-            conn = sqlite3.connect(manager.database)
+            bot.send_photo(call.message.chat.id, open(os.path.join('img', img),'rb'))
+            conn = sqlite3.connect(DATABASE)
             with conn:
                 conn.execute(
                     'INSERT INTO winners (user_id, prize_id, win_time) VALUES (?, ?, datetime("now"))',
-                    (user_id, prize_id)
+                    (uid, pid)
                 )
-            bot.answer_callback_query(call.id, "Поздравляем! Вы выиграли приз.")
+            bot.answer_callback_query(call.id, "Ты выиграл!")
         else:
-            bot.answer_callback_query(call.id, "Ошибка: изображение не найдено.")
+            bot.answer_callback_query(call.id, "Ошибка: нет изображения.")
     else:
-        # Для тех, кто слишком медлил
-        bot.answer_callback_query(call.id, "К сожалению, вы не успели получить приз.")
+        bot.answer_callback_query(call.id, "Увы, приз разобран.")
 
-# Функция рассылки новой пикселизированной картинки
 def send_message():
     prize = manager.get_random_prize()
     if prize is None:
         print("Нет доступных призов")
         return
-    prize_id, img = prize
-    manager.mark_prize_used(prize_id)
+    pid, img = prize
+    manager.mark_prize_used(pid)
     try:
         hide_img(img)
     except FileNotFoundError as e:
-        print(e)
-        return
-    hidden = os.path.join('hidden_img', img)
-    for uid in manager.get_users():
-        if os.path.isfile(hidden):
-            with open(hidden, 'rb') as photo:
-                bot.send_photo(uid, photo, reply_markup=gen_markup(prize_id))
-        else:
-            print(f"Не найден файл для рассылки: {hidden}")
+        print(e); return
+    hid = os.path.join('hidden_img', img)
+    for user in manager.get_users():
+        with open(hid, 'rb') as ph:
+            bot.send_photo(user, ph, reply_markup=gen_markup(pid))
 
-# Поток для планировщика
 def schedule_thread():
     schedule.every().hour.do(send_message)
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        schedule.run_pending(); time.sleep(1)
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: bot.polling(none_stop=True), daemon=True).start()
